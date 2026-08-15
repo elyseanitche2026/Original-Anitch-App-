@@ -1,0 +1,361 @@
+// ==========================================================
+// ANITCHÉ — Schéma Prisma
+// PostgreSQL + extension PostGIS pour la géolocalisation
+// ==========================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis]
+}
+
+// ------------------------
+// ENUMS
+// ------------------------
+
+enum Role {
+  MERCHANT
+  COURIER
+  RECIPIENT // destinataire inscrit sur l'app (facultatif ; sinon repli OTP)
+  ADMIN
+}
+
+enum DeliveryStatus {
+  PENDING             // créée, en attente d'un livreur
+  BROADCASTING        // en cours de diffusion aux livreurs proches
+  NEGOTIATING         // un livreur a contre-proposé, en attente d'accord
+  ACCEPTED            // prix verrouillé, livreur assigné
+  PICKED_UP           // QR de départ scanné chez le commerçant
+  IN_TRANSIT          // en cours d'acheminement
+  DELIVERED           // QR/OTP d'arrivée validé, prix final calculé
+  CANCELLED           // annulée par le commerçant ou l'admin
+  DISPUTED            // litige ouvert
+}
+
+enum NegotiationStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  SUPERSEDED // remplacée par une contre-offre plus récente
+}
+
+enum ProposedBy {
+  MERCHANT
+  COURIER
+}
+
+enum PriceAdjustmentReason {
+  NONE
+  COURIER_DELAY          // retard imputable au livreur -> minoration
+  RECIPIENT_RELOCATED     // destinataire déplacé / mauvaise position -> majoration
+  BOTH
+}
+
+enum CompletionMethod {
+  QR_CODE
+  OTP_FALLBACK
+}
+
+enum SurveyRespondent {
+  RECIPIENT
+  MERCHANT
+}
+
+enum CourierAvailability {
+  AVAILABLE
+  BUSY
+  OFFLINE
+}
+
+enum VehicleType {
+  MOTO
+  TRICYCLE
+  VOITURE
+  VELO
+}
+
+enum TransactionType {
+  DELIVERY_EARNING   // gain d'une course
+  COMMISSION         // prélèvement plateforme (12%)
+  TOPUP              // recharge Mobile Money
+  WITHDRAWAL         // retrait vers Mobile Money
+  RSTI_SUBSIDY       // subvention cotisation RSTI
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum KycStatus {
+  NOT_SUBMITTED
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+}
+
+// ------------------------
+// USERS & AUTH
+// ------------------------
+
+model User {
+  id            String   @id @default(uuid())
+  phone         String   @unique
+  email         String?  @unique
+  passwordHash  String
+  fullName      String
+  role          Role
+  isActive      Boolean  @default(true)
+  refreshToken  String?  // dernier refresh token émis (rotation)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations spécifiques
+  merchantProfile  MerchantProfile?
+  courierProfile   CourierProfile?
+  recipientProfile RecipientProfile?
+
+  @@map("users")
+}
+
+/// Compte allégé pour un destinataire ayant installé l'app. Créé automatiquement
+/// (ou lié) via le numéro de téléphone renseigné à la création d'une course.
+/// Si le destinataire n'a pas l'app, ce profil n'existe pas et le flux de
+/// clôture bascule sur le repli OTP (cf. Delivery.completionMethod).
+model RecipientProfile {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  deliveries Delivery[] @relation("RecipientDeliveries")
+  surveys    SatisfactionSurvey[] @relation("RecipientSurveys")
+
+  @@map("recipient_profiles")
+}
+
+model MerchantProfile {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shopName    String
+  shopAddress String?
+
+  deliveries  Delivery[] @relation("MerchantDeliveries")
+  surveys     SatisfactionSurvey[] @relation("MerchantSurveys")
+
+  @@map("merchant_profiles")
+}
+
+model CourierProfile {
+  id             String              @id @default(uuid())
+  userId         String              @unique
+  user           User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  availability   CourierAvailability @default(OFFLINE)
+  kycStatus      KycStatus           @default(NOT_SUBMITTED)
+  kycDocumentUrl String?
+  rating         Float               @default(5.0)
+  walletBalance  Int                 @default(0) // en FCFA, entier pour éviter les erreurs flottantes
+
+  // Position courante (PostGIS geography point, lon/lat)
+  currentLocation Unsupported("geography(Point, 4326)")?
+  lastLocationAt  DateTime?
+
+  vehicles       Vehicle[]
+  deliveries     Delivery[] @relation("CourierDeliveries")
+  reviews        Review[]
+  transactions   Transaction[]
+
+  @@map("courier_profiles")
+  @@index([availability])
+}
+
+model Vehicle {
+  id         String      @id @default(uuid())
+  courierId  String
+  courier    CourierProfile @relation(fields: [courierId], references: [id], onDelete: Cascade)
+  type       VehicleType
+  plateNumber String?
+  brand      String?
+  isDefault  Boolean     @default(true)
+
+  @@map("vehicles")
+}
+
+// ------------------------
+// DELIVERIES
+// ------------------------
+
+model Delivery {
+  id                String         @id @default(uuid())
+  merchantId        String
+  merchant          MerchantProfile @relation("MerchantDeliveries", fields: [merchantId], references: [id])
+  courierId         String?
+  courier           CourierProfile? @relation("CourierDeliveries", fields: [courierId], references: [id])
+  recipientId       String?        // renseigné si le destinataire a l'app (RecipientProfile)
+  recipient         RecipientProfile? @relation("RecipientDeliveries", fields: [recipientId], references: [id])
+
+  status            DeliveryStatus @default(PENDING)
+
+  // Adresses + coordonnées géospatiales déclarées à la création
+  pickupAddress     String
+  pickupLocation    Unsupported("geography(Point, 4326)")
+  dropoffAddress    String
+  dropoffLocation   Unsupported("geography(Point, 4326)")
+
+  // Position réelle constatée à la clôture (peut différer de dropoffLocation
+  // si le destinataire s'est déplacé) — sert au calcul de l'ajustement de prix.
+  actualDropoffLocation Unsupported("geography(Point, 4326)")?
+
+  packageType       String
+  packageWeightKg   Float?
+  recipientPhone    String
+  recipientName     String?
+
+  // --- Tarification ---
+  referencePrice     Int            // prix homologué calculé à la création (grille + distance)
+  negotiatedPrice     Int?          // prix verrouillé à l'issue de la négociation (base du calcul final)
+  finalPrice          Int?          // prix réellement facturé après ajustement à la clôture
+  priceAdjustmentReason PriceAdjustmentReason @default(NONE)
+  commissionRate      Float          @default(0.12)
+  commissionAmount    Int?           // calculé sur finalPrice une fois la course clôturée
+
+  // --- Timing (pour l'ajustement de prix et le compte à rebours) ---
+  estimatedDurationMinutes Int?      // calculé au scan du QR de départ (API de routage)
+
+  // --- Validation double QR / OTP ---
+  pickupQrToken       String         @unique // encodé dans le QR affiché côté commerçant
+  pickupValidatedAt   DateTime?
+  dropoffQrToken      String         @unique // encodé dans le QR affiché côté destinataire (si app)
+  dropoffOtpCode      String?        // généré uniquement si le destinataire n'a pas l'app
+  dropoffValidatedAt  DateTime?
+  completionMethod    CompletionMethod?
+
+  acceptedAt         DateTime?
+  cancelledAt        DateTime?
+  cancelReason       String?
+
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  review              Review?
+  transactions        Transaction[]
+  priceOffers          PriceOffer[]
+  satisfactionSurveys  SatisfactionSurvey[]
+
+  @@map("deliveries")
+  @@index([status])
+  @@index([merchantId])
+  @@index([courierId])
+}
+
+/// Grille tarifaire homologuée : prix pivot par tranche de distance,
+/// administrable depuis le back-office (aucune valeur en dur dans le code).
+model PriceGridTier {
+  id             String   @id @default(uuid())
+  minDistanceM   Int      // borne basse (mètres), incluse
+  maxDistanceM   Int?     // borne haute (mètres), exclue ; null = illimité
+  basePrice      Int      // FCFA
+  maxNegotiationPct Float @default(0.20) // écart autorisé de part et d'autre du prix pivot
+  isActive       Boolean  @default(true)
+
+  @@map("price_grid_tiers")
+  @@index([isActive])
+}
+
+/// Historique des offres/contre-offres pendant la négociation du prix.
+model PriceOffer {
+  id          String        @id @default(uuid())
+  deliveryId  String
+  delivery    Delivery      @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  proposedBy  ProposedBy
+  amount      Int           // FCFA
+  status      NegotiationStatus @default(PENDING)
+  createdAt   DateTime      @default(now())
+
+  @@map("price_offers")
+  @@index([deliveryId])
+}
+
+/// Enquête de satisfaction envoyée au destinataire ET au commerçant après
+/// clôture d'une course (deux lignes distinctes par course, une par répondant).
+model SatisfactionSurvey {
+  id             String            @id @default(uuid())
+  deliveryId     String
+  delivery       Delivery          @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  respondentType SurveyRespondent
+  recipientId    String?
+  recipient      RecipientProfile? @relation("RecipientSurveys", fields: [recipientId], references: [id])
+  merchantId     String?
+  merchant       MerchantProfile?  @relation("MerchantSurveys", fields: [merchantId], references: [id])
+
+  courierRating  Int?              // 1 à 5, note du livreur / professionnalisme
+  appRating      Int?              // 1 à 5, note de l'application
+  comment        String?
+  respondedAt    DateTime?
+  sentAt         DateTime          @default(now())
+
+  @@map("satisfaction_surveys")
+  @@index([deliveryId])
+}
+
+// ------------------------
+// REVIEWS (déprécié)
+// ------------------------
+// Conservé pour compatibilité avec les données existantes, mais remplacé
+// fonctionnellement par SatisfactionSurvey (qui couvre à la fois la note
+// livreur ET la note application, côté destinataire ET côté commerçant).
+// À retirer une fois la migration des anciennes données effectuée.
+
+model Review {
+  id          String         @id @default(uuid())
+  deliveryId  String         @unique
+  delivery    Delivery       @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  courierId   String
+  courier     CourierProfile @relation(fields: [courierId], references: [id])
+  rating      Int            // 1 à 5
+  comment     String?
+  createdAt   DateTime       @default(now())
+
+  @@map("reviews")
+}
+
+// ------------------------
+// TRANSACTIONS (wallet)
+// ------------------------
+
+model Transaction {
+  id           String             @id @default(uuid())
+  courierId    String
+  courier      CourierProfile     @relation(fields: [courierId], references: [id])
+  deliveryId   String?
+  delivery     Delivery?          @relation(fields: [deliveryId], references: [id])
+  type         TransactionType
+  status       TransactionStatus  @default(PENDING)
+  amount       Int                // FCFA, toujours positif ; le "sens" est donné par `type`
+  provider     String?            // ORANGE_MONEY, WAVE, MTN, MOOV
+  providerRef  String?            // référence externe Mobile Money
+  createdAt    DateTime           @default(now())
+
+  @@map("transactions")
+  @@index([courierId])
+}
+
+// ------------------------
+// HISTORIQUE DE POSITIONS (pour audit / rejouer un trajet)
+// ------------------------
+
+model LocationPing {
+  id         String   @id @default(uuid())
+  courierId  String
+  location   Unsupported("geography(Point, 4326)")
+  createdAt  DateTime @default(now())
+
+  @@map("location_pings")
+  @@index([courierId, createdAt])
+}
