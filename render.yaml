@@ -1,0 +1,53 @@
+# ==========================================================
+# ANITCHÉ — Render Blueprint
+# Déploiement en un clic : Dashboard Render → New → Blueprint
+# → connecter le repo GitHub → Render détecte ce fichier automatiquement.
+# Doc : https://render.com/docs/infrastructure-as-code
+# ==========================================================
+
+databases:
+  - name: anitche-db
+    databaseName: anitche
+    user: anitche
+    plan: starter          # basic-256mb — persistant, pas de suppression à 30 jours.
+                            # Mettre "free" pour un tout premier essai (1 Go, expire au bout de 30 jours).
+    region: frankfurt       # région la plus proche d'Abidjan disponible chez Render
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: anitche-backend
+    runtime: node
+    plan: starter           # évite la mise en veille après 15 min (mauvais pour Socket.io).
+                             # Mettre "free" pour un premier test technique seulement.
+    region: frankfurt
+    branch: main
+
+    # --include=dev est nécessaire : sinon npm saute les devDependencies (tsc, prisma CLI, tsx)
+    # quand NODE_ENV=production est déjà positionné, et le build casse.
+    buildCommand: npm install --include=dev && npx prisma generate && npm run build
+
+    # Exécuté juste avant que la nouvelle version ne prenne le trafic : migrations + seed.
+    # Le seed est idempotent (cf. prisma/seed.ts) donc sans risque à chaque déploiement.
+    # NB : preDeployCommand n'est disponible que sur les plans payants (starter et +).
+    preDeployCommand: npx prisma migrate deploy && npx tsx prisma/seed.ts
+
+    startCommand: npm run start
+    healthCheckPath: /health
+    autoDeployTrigger: commit   # redéploie automatiquement à chaque push sur `branch`
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: anitche-db
+          property: connectionString
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: JWT_ACCESS_EXPIRES_IN
+        value: 15m
+      - key: JWT_REFRESH_EXPIRES_IN
+        value: 30
